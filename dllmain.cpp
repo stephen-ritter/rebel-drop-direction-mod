@@ -23,20 +23,65 @@ static std::atomic<uintptr_t> g_LiveMgr{ 0 };
 
 // ============================================================================
 // LOGGING (thread-safe: worker + hook both log)
+//
+// Disabled by default. On first launch the mod creates
+// "jc3_rebel_orient.ini" next to the game exe (if it doesn't already
+// exist) with a default template. Set Logging=1 in that file and relaunch;
+// the mod then creates "jc3_rebel_orient.log" automatically.
 // ============================================================================
 static CRITICAL_SECTION g_LogCS;
 static FILE* g_LogFile = nullptr;
 static bool  g_LogInit = false;
+static bool  g_LoggingEnabled = false;
+
+// Build a path in the game directory (the folder containing the exe).
+static bool GetGameDirPath(const char* fileName, char* out, size_t outSize) {
+    char exePath[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, exePath, MAX_PATH) == 0) return false;
+    char* slash = strrchr(exePath, '\\');
+    if (slash) slash[1] = '\0';
+    snprintf(out, outSize, "%s%s", exePath, fileName);
+    return true;
+}
+
+// Create the ini with a default template if it doesn't exist yet, so the
+// user never has to create it by hand. Never overwrites an existing file.
+static void EnsureConfigFile(const char* iniPath) {
+    if (GetFileAttributesA(iniPath) != INVALID_FILE_ATTRIBUTES) return;  // exists
+    FILE* f = nullptr;
+    if (fopen_s(&f, iniPath, "w") == 0 && f) {
+        fprintf(f, "; RebelDropDirectionMod configuration\n");
+        fprintf(f, "; Set Logging=1 to write jc3_rebel_orient.log next to the game exe.\n");
+        fprintf(f, "[General]\n");
+        fprintf(f, "Logging=0\n");
+        fclose(f);
+    }
+}
 
 static void LogInit() {
     if (g_LogInit) return;
     InitializeCriticalSection(&g_LogCS);
-    fopen_s(&g_LogFile, "jc3_rebel_orient.log", "a");
+
+    char iniPath[MAX_PATH] = {};
+    if (GetGameDirPath("jc3_rebel_orient.ini", iniPath, sizeof(iniPath))) {
+        EnsureConfigFile(iniPath);   // create template if missing
+        // Missing key / unreadable file -> 0 -> logging disabled.
+        g_LoggingEnabled = (GetPrivateProfileIntA("General", "Logging", 0, iniPath) != 0);
+
+        if (g_LoggingEnabled) {
+            char logPath[MAX_PATH] = {};
+            if (GetGameDirPath("jc3_rebel_orient.log", logPath, sizeof(logPath))) {
+                errno_t err = fopen_s(&g_LogFile, logPath, "a");  // "a" creates the file
+                if (err != 0) g_LogFile = nullptr;
+            }
+        }
+    }
     g_LogInit = true;
 }
 
 void LogMessage(const char* format, ...) {
-    if (!g_LogInit || !g_LogFile) return;
+    // One flag check on the hot path when logging is off — effectively free.
+    if (!g_LoggingEnabled || !g_LogFile) return;
     EnterCriticalSection(&g_LogCS);
     va_list args; va_start(args, format);
     vfprintf(g_LogFile, format, args); va_end(args);
