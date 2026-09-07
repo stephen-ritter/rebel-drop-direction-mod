@@ -11,30 +11,40 @@
 // ============================================================================
 uintptr_t g_GameBase = 0;
 
-constexpr uintptr_t OFFSET_VEHICLE_SPAWNER = 0xDD3070;    // Ghidra: FUN_140dd3070
+constexpr uintptr_t OFFSET_VEHICLE_SPAWNER = 0xDD3070;      // Ghidra: FUN_140dd3070
+constexpr uintptr_t OFFSET_DROP_LIFECYCLE = 0xDEd9e0;      // Ghidra: FUN_140ded9e0 (lifecycle state machine)
+constexpr uintptr_t OFFSET_STATE_ENUM = 0x12C;         // state on drop-request object (param_1 + 300)
 constexpr uintptr_t RVA_CCAMERAMANAGER_VTABLE = 0x2309C20;  // CCameraManager vtable (Ghidra)
-constexpr uintptr_t OFFSET_CAMERA_FORWARD = 0x044;      // live forward, confirmed by flip test
+constexpr uintptr_t OFFSET_CAMERA_FORWARD = 0x044;         // live forward, confirmed by flip test
+
+// Lifecycle state value for "beacon thrown / airborne" (the initiation point).
+// Adjust if the logged state sequence shows a different number.
+constexpr int32_t STATE_BEACON_THROWN = 2;
 
 typedef int64_t(__fastcall* tVehicleSpawner)(int64_t*, int64_t*, float*);
 tVehicleSpawner oVehicleSpawner = nullptr;
 
+// Lifecycle state machine. Two params: drop object ptr (RCX) + delta time (XMM0).
+typedef void(__fastcall* tDropLifecycle)(int64_t* dropObj, float deltaTime);
+tDropLifecycle oDropLifecycle = nullptr;
+
 // Published by the worker thread, read by the game thread.
 static std::atomic<uintptr_t> g_LiveMgr{ 0 };
 
+// Facing vector locked in when the rebel drop is initiated (beacon thrown).
+static std::atomic<float> g_LockedFwdX{ 0.0f };
+static std::atomic<float> g_LockedFwdZ{ 0.0f };
+static std::atomic<bool>  g_HasLocked{ false };
+
 // ============================================================================
 // LOGGING (thread-safe: worker + hook both log)
-//
-// Disabled by default. On first launch the mod creates
-// "jc3_rebel_orient.ini" next to the game exe (if it doesn't already
-// exist) with a default template. Set Logging=1 in that file and relaunch;
-// the mod then creates "jc3_rebel_orient.log" automatically.
+// Disabled by default. Auto-creates jc3_rebel_orient.ini on first launch.
 // ============================================================================
 static CRITICAL_SECTION g_LogCS;
 static FILE* g_LogFile = nullptr;
 static bool  g_LogInit = false;
 static bool  g_LoggingEnabled = false;
 
-// Build a path in the game directory (the folder containing the exe).
 static bool GetGameDirPath(const char* fileName, char* out, size_t outSize) {
     char exePath[MAX_PATH] = {};
     if (GetModuleFileNameA(nullptr, exePath, MAX_PATH) == 0) return false;
@@ -44,10 +54,8 @@ static bool GetGameDirPath(const char* fileName, char* out, size_t outSize) {
     return true;
 }
 
-// Create the ini with a default template if it doesn't exist yet, so the
-// user never has to create it by hand. Never overwrites an existing file.
 static void EnsureConfigFile(const char* iniPath) {
-    if (GetFileAttributesA(iniPath) != INVALID_FILE_ATTRIBUTES) return;  // exists
+    if (GetFileAttributesA(iniPath) != INVALID_FILE_ATTRIBUTES) return;
     FILE* f = nullptr;
     if (fopen_s(&f, iniPath, "w") == 0 && f) {
         fprintf(f, "; RebelDropDirectionMod configuration\n");
@@ -61,17 +69,14 @@ static void EnsureConfigFile(const char* iniPath) {
 static void LogInit() {
     if (g_LogInit) return;
     InitializeCriticalSection(&g_LogCS);
-
     char iniPath[MAX_PATH] = {};
     if (GetGameDirPath("jc3_rebel_orient.ini", iniPath, sizeof(iniPath))) {
-        EnsureConfigFile(iniPath);   // create template if missing
-        // Missing key / unreadable file -> 0 -> logging disabled.
+        EnsureConfigFile(iniPath);
         g_LoggingEnabled = (GetPrivateProfileIntA("General", "Logging", 0, iniPath) != 0);
-
         if (g_LoggingEnabled) {
             char logPath[MAX_PATH] = {};
             if (GetGameDirPath("jc3_rebel_orient.log", logPath, sizeof(logPath))) {
-                errno_t err = fopen_s(&g_LogFile, logPath, "a");  // "a" creates the file
+                errno_t err = fopen_s(&g_LogFile, logPath, "a");
                 if (err != 0) g_LogFile = nullptr;
             }
         }
@@ -80,7 +85,6 @@ static void LogInit() {
 }
 
 void LogMessage(const char* format, ...) {
-    // One flag check on the hot path when logging is off — effectively free.
     if (!g_LoggingEnabled || !g_LogFile) return;
     EnterCriticalSection(&g_LogCS);
     va_list args; va_start(args, format);
@@ -101,8 +105,6 @@ static float VecLen(const float* v) {
     return sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
 }
 
-// Cheap validity check for a candidate/cached pointer: vtable present AND
-// +0x044 holds a unit vector. Two small reads — safe on the hot path.
 static bool IsLiveCameraManager(uintptr_t mgr) {
     if (mgr == 0) return false;
     uintptr_t vt = 0;
@@ -117,8 +119,6 @@ static bool IsLiveCameraManager(uintptr_t mgr) {
 // ============================================================================
 // EXPENSIVE HUNT  -- ONLY EVER RUN ON THE WORKER THREAD
 // ============================================================================
-// Count unit-length vectors in [base, base+0x400). Real manager = "rich";
-// a transient garbage block holding the vtable word = sparse.
 static int CountUnitVectors(uintptr_t base) {
     int score = 0;
     for (uintptr_t off = 0; off < 0x400; off += 4) {
@@ -130,8 +130,6 @@ static int CountUnitVectors(uintptr_t base) {
     return score;
 }
 
-// Full address-space scan: find every vtable match, pick the richest candidate
-// whose +0x044 is a live forward, publish atomically.
 static void DoFullHunt() {
     const uintptr_t targetVTable = g_GameBase + RVA_CCAMERAMANAGER_VTABLE;
     SYSTEM_INFO si; GetSystemInfo(&si);
@@ -157,13 +155,11 @@ static void DoFullHunt() {
                         ++candidateCount;
                         const uintptr_t cand = reinterpret_cast<uintptr_t>(&buf[i]);
 
-                        // Cheap gate first: +0x044 must hold a unit vector.
                         float v[3] = { 0, 0, 0 };
                         if (!SafeReadMemory(cand + OFFSET_CAMERA_FORWARD, v, sizeof(v))) continue;
                         const float len = VecLen(v);
                         if (len < 0.9f || len > 1.1f) continue;
 
-                        // Expensive richness, only for gated candidates.
                         const int score = CountUnitVectors(cand);
                         if (score > bestScore) { bestScore = score; best = cand; }
                     }
@@ -185,8 +181,6 @@ static void DoFullHunt() {
         LogMessage("[Cam] hunt: no live manager found (%d candidates)\n", candidateCount);
 }
 
-// Worker: the ONLY place the expensive scan runs. Hunts immediately, then
-// re-hunts (self-heals) only if the cached manager dies.
 DWORD WINAPI CameraHuntThread(LPVOID) {
     while (true) {
         if (!IsLiveCameraManager(g_LiveMgr.load()))
@@ -201,7 +195,7 @@ DWORD WINAPI CameraHuntThread(LPVOID) {
 // ============================================================================
 bool GetCameraForwardVector(float& outX, float& outZ) {
     const uintptr_t mgr = g_LiveMgr.load();
-    if (!IsLiveCameraManager(mgr)) return false;   // worker re-hunts within ~300ms
+    if (!IsLiveCameraManager(mgr)) return false;
 
     float fX, fY, fZ;
     if (!SafeReadMemory(mgr + OFFSET_CAMERA_FORWARD, &fX, sizeof(fX)) ||
@@ -218,28 +212,80 @@ bool GetCameraForwardVector(float& outX, float& outZ) {
 }
 
 // ============================================================================
-// VEHICLE SPAWNER HOOK (unchanged — verified working)
+// LIFECYCLE STATE MACHINE HOOK — captures the camera at the initiation
+// ============================================================================
+void __fastcall hkDropLifecycle(int64_t* param_1, float param_2) {
+    // Read the state BEFORE the original advances it, so we see the phase
+    // being processed this frame.
+    int32_t state = 0;
+    if (param_1) SafeReadMemory((uintptr_t)param_1 + OFFSET_STATE_ENUM, &state, sizeof(state));
+
+    static std::atomic<int32_t> s_LastState{ 0 };
+    const int32_t prev = s_LastState.load();
+
+    // Diagnostic: log every transition so the state->phase mapping can be
+    // confirmed (or STATE_BEACON_THROWN adjusted) from a single throw.
+    if (state != prev)
+        LogMessage("[Lifecycle] state %d -> %d\n", prev, state);
+
+    // Capture the camera on the transition INTO the "beacon thrown" state —
+    // the initiation. Fires once per drop, not per frame.
+    if (state == STATE_BEACON_THROWN && prev != STATE_BEACON_THROWN) {
+        float fX, fZ;
+        if (GetCameraForwardVector(fX, fZ)) {
+            g_LockedFwdX.store(fX);
+            g_LockedFwdZ.store(fZ);
+            g_HasLocked.store(true);
+            LogMessage("[Lifecycle] initiation - LOCKED facing (%.3f, %.3f)\n", fX, fZ);
+        }
+        else {
+            LogMessage("[Lifecycle] initiation - camera read failed\n");
+        }
+    }
+    s_LastState.store(state);
+
+    // Forward both params with the correct types so the float lands back in XMM0.
+    oDropLifecycle(param_1, param_2);
+}
+
+// ============================================================================
+// VEHICLE SPAWNER HOOK — uses the throw-locked facing
 // ============================================================================
 int64_t __fastcall hkVehicleSpawner(int64_t* param_1, int64_t* param_2, float* param_3) {
     if (param_3 != nullptr) {
         __try {
-            float camX, camZ;
-            if (GetCameraForwardVector(camX, camZ)) {
-                const float fX = camX, fZ = camZ;
-                const float rX = fZ, rZ = -fX;
-                const float crateX = param_3[12], crateY = param_3[13], crateZ = param_3[14];
+            float fX = 0.0f, fZ = 0.0f;
+            bool have = false;
 
-                param_3[0] = rX;   param_3[1] = 0.0f; param_3[2] = rZ;   param_3[3] = 0.0f;
-                param_3[4] = 0.0f; param_3[5] = 1.0f; param_3[6] = 0.0f; param_3[7] = 0.0f;
-                param_3[8] = fX;   param_3[9] = 0.0f; param_3[10] = fZ;   param_3[11] = 0.0f;
-                param_3[12] = crateX; param_3[13] = crateY; param_3[14] = crateZ; param_3[15] = 1.0f;
+            if (g_HasLocked.load()) {
+                fX = g_LockedFwdX.load();
+                fZ = g_LockedFwdZ.load();
+                have = true;
+            }
+            else if (GetCameraForwardVector(fX, fZ)) {
+                have = true;   // fallback: no throw seen yet, use live camera
+            }
+
+            if (have) {
+                const float lenXZ = sqrtf(fX * fX + fZ * fZ);
+                if (lenXZ > 0.001f) {
+                    fX /= lenXZ;
+                    fZ /= lenXZ;
+                    const float rX = fZ, rZ = -fX;
+                    const float crateX = param_3[12], crateY = param_3[13], crateZ = param_3[14];
+
+                    param_3[0] = rX;   param_3[1] = 0.0f; param_3[2] = rZ;   param_3[3] = 0.0f;
+                    param_3[4] = 0.0f; param_3[5] = 1.0f; param_3[6] = 0.0f; param_3[7] = 0.0f;
+                    param_3[8] = fX;   param_3[9] = 0.0f; param_3[10] = fZ;   param_3[11] = 0.0f;
+                    param_3[12] = crateX; param_3[13] = crateY; param_3[14] = crateZ; param_3[15] = 1.0f;
+                }
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             LogMessage("[ERROR] exception inside spawner hook\n");
         }
     }
-    return oVehicleSpawner(param_1, param_2, param_3);   // forward ALL original args
+    return oVehicleSpawner(param_1, param_2, param_3);
 }
 
 // ============================================================================
@@ -255,12 +301,15 @@ DWORD WINAPI MainThread(LPVOID) {
     if (MH_Initialize() != MH_OK) { LogMessage("[FATAL] MH_Initialize\n"); return 1; }
     if (MH_CreateHook(reinterpret_cast<LPVOID>(g_GameBase + OFFSET_VEHICLE_SPAWNER),
         &hkVehicleSpawner, reinterpret_cast<LPVOID*>(&oVehicleSpawner)) != MH_OK) {
-        LogMessage("[FATAL] MH_CreateHook\n"); return 1;
+        LogMessage("[FATAL] MH_CreateHook spawner\n"); return 1;
+    }
+    if (MH_CreateHook(reinterpret_cast<LPVOID>(g_GameBase + OFFSET_DROP_LIFECYCLE),
+        &hkDropLifecycle, reinterpret_cast<LPVOID*>(&oDropLifecycle)) != MH_OK) {
+        LogMessage("[FATAL] MH_CreateHook lifecycle\n"); return 1;
     }
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) { LogMessage("[FATAL] MH_EnableHook\n"); return 1; }
-    LogMessage("[OK] hook installed\n");
+    LogMessage("[OK] hooks installed\n");
 
-    // Start the background hunt so the game thread never does the full scan.
     CreateThread(NULL, 0, CameraHuntThread, NULL, 0, NULL);
     return 0;
 }
